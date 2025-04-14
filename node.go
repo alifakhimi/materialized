@@ -32,3 +32,24 @@ func NewNodeID() NodeID {
 	id := ulid.MustNew(ulid.Timestamp(time.Now()), entropy)
 	return NodeID(id.String())
 }
+
+// Validate checks if the NodeID is a valid ULID
+func (nid NodeID) Validate() error {
+	_, err := ulid.Parse(string(nid))
+	return err
+}
+
+func Validate(nid NodeID) error {
+	return nid.Validate()
+}
+
+func ValidateNil(nid *NodeID) error {
+	if nid == nil {
+		return nil
+	}
+	return nid.Validate()
+}
+
+func IsValidNodeID(nid *NodeID) bool {
+	return ValidateNil(nid) == nil
+}

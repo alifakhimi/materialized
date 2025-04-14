@@ -73,10 +73,6 @@ func (p Path) AppendNode(nodeID NodeID) (Path, error) {
 		return "", fmt.Errorf("node ID cannot contain the path separator '%s'", PathSeparator)
 	}
 
-	if p.IsRoot() {
-		return Path(nodeID), nil
-	}
-
 	return Path(fmt.Sprintf("%s%s%s", strings.TrimSuffix(string(p), PathSeparator), PathSeparator, nodeID)), nil
 }
 

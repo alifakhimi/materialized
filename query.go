@@ -20,63 +20,52 @@ const (
 	CondPathCol = "%s = ?"
 )
 
+type Code = NodeID
+
 // TreeNode represents a node in the materialized path tree
 type TreeNode struct {
 	gorm.Model
 
 	// Code is a unique node identifier
-	Code NodeID `gorm:"type:varchar(26);uniqueIndex"`
+	Code Code `json:"code,omitempty" gorm:"column:code;uniqueIndex:idx_code,sort:asc"`
 
-	// Multi-tenancy fields
-	TenantID   uint   `gorm:"index:idx_tenant"`
-	TenantType string `gorm:"index:idx_tenant"`
+	// Tenancy fields
+	Tenant TenantFields `json:"tenant_fields,omitempty" gorm:"embedded"`
 
 	// Parent-child relationship
-	ParentID uint        `gorm:"index:idx_parent"`
-	Parent   *TreeNode   `gorm:"foreignKey:ParentID"`
-	Children []*TreeNode `gorm:"foreignKey:ParentID"`
+	ParentID *Code       `json:"parent_id,omitempty" gorm:"column:parent_id;size:26;index:idx_parent_id;default:null"`
+	Parent   *TreeNode   `json:"parent,omitempty" gorm:"foreignKey:ParentID;references:Code"`
+	Children []*TreeNode `json:"children,omitempty" gorm:"foreignKey:ParentID;references:Code"`
 
-	Path Path `gorm:"index:idx_path"`
-	Name string
+	Path Path   `json:"path,omitempty" gorm:"column:path;index:idx_path"`
+	Name string `json:"name,omitempty" gorm:"column:name"`
 
+	// Owner fields
+	Owner OwnerFields `json:"owner_fields,omitempty" gorm:"embedded"`
+}
+
+type TenantFields struct {
+	// Multi-tenancy fields
+	ID   string `json:"id,omitempty" gorm:"column:tenant_id;index:idx_tenant"`
+	Type string `json:"type,omitempty" gorm:"column:tenant_type;index:idx_tenant"`
+}
+
+type OwnerFields struct {
 	// Polymorphic owner association
-	OwnerID   uint   `gorm:"index:idx_owner"`
-	OwnerType string `gorm:"index:idx_owner"`
-
-	// Metadata
-	Metadata map[string]interface{} `gorm:"serializer:json"`
+	ID   string `json:"id,omitempty" gorm:"column:owner_id;index:idx_owner"`
+	Type string `json:"type,omitempty" gorm:"column:owner_type;index:idx_owner"`
 }
 
 // TableConfig holds configuration for the tree table
 type TableConfig struct {
 	// TableName is the name of the table in the database
 	TableName string
-
-	// PathColumn is the name of the column that stores the materialized path
-	PathColumn string
-
-	// TenantIDColumn is the name of the column that stores the tenant ID
-	TenantIDColumn string
-
-	// TenantTypeColumn is the name of the column that stores the tenant type
-	TenantTypeColumn string
-
-	// OwnerIDColumn is the name of the column that stores the owner ID
-	OwnerIDColumn string
-
-	// OwnerTypeColumn is the name of the column that stores the owner type
-	OwnerTypeColumn string
 }
 
 // DefaultTableConfig returns the default table configuration
 func DefaultTableConfig() TableConfig {
 	return TableConfig{
-		TableName:        "tree_nodes",
-		PathColumn:       "path",
-		TenantIDColumn:   "tenant_id",
-		TenantTypeColumn: "tenant_type",
-		OwnerIDColumn:    "owner_id",
-		OwnerTypeColumn:  "owner_type",
+		TableName: "tree_nodes",
 	}
 }
 
@@ -88,9 +77,7 @@ type TreeQuery struct {
 
 // NewTreeQuery creates a new TreeQuery instance
 func NewTreeQuery(db *gorm.DB, config TableConfig) (*TreeQuery, error) {
-	if config.TableName == "" || config.PathColumn == "" ||
-		config.TenantIDColumn == "" || config.TenantTypeColumn == "" ||
-		config.OwnerIDColumn == "" || config.OwnerTypeColumn == "" {
+	if config.TableName == "" {
 		return nil, ErrInvalidTableConfig
 	}
 
@@ -101,40 +88,34 @@ func NewTreeQuery(db *gorm.DB, config TableConfig) (*TreeQuery, error) {
 }
 
 // tenantScope adds tenant-based security scope to queries
-func (tq *TreeQuery) tenantScope(tenantID uint, tenantType string) func(db *gorm.DB) *gorm.DB {
+func (tq *TreeQuery) tenantScope(tenantID, tenantType string) func(db *gorm.DB) *gorm.DB {
 	return func(db *gorm.DB) *gorm.DB {
-		return db.Where(fmt.Sprintf("%s = ? AND %s = ?",
-			tq.config.TenantIDColumn, tq.config.TenantTypeColumn),
-			tenantID, tenantType)
+		return db.Where(TenantFields{tenantID, tenantType})
 	}
 }
 
-// GetNodeByID retrieves a node by its ID with tenant security
-func (tq *TreeQuery) GetNodeByID(id uint, tenantID uint, tenantType string) (*TreeNode, error) {
-	var node TreeNode
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(CondID, id).
-		First(&node)
+// ownerScope adds owner-based scope to queries
+func (tq *TreeQuery) ownerScope(ownerID, ownerType string) func(db *gorm.DB) *gorm.DB {
+	return func(db *gorm.DB) *gorm.DB {
+		return db.Where(OwnerFields{ownerID, ownerType})
+	}
+}
 
-	if result.Error != nil {
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return nil, ErrUnauthorized
-		}
-		return nil, result.Error
+func (tq *TreeQuery) GetNodeByCodeQuery(tx *gorm.DB, code Code, tenantID, tenantType string) *gorm.DB {
+	if err := code.Validate(); err != nil {
+		tx.AddError(fmt.Errorf("invalid code: %w", err))
+		return tx
 	}
 
-	return &node, nil
+	return tq.db.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Where(TreeNode{Code: code})
 }
 
 // GetNodeByCode retrieves a node by its code with tenant security
-func (tq *TreeQuery) GetNodeByCode(code NodeID, tenantID uint, tenantType string) (*TreeNode, error) {
+func (tq *TreeQuery) GetNodeByCode(code Code, tenantID, tenantType string) (*TreeNode, error) {
 	var node TreeNode
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where("code = ?", code).
-		First(&node)
-
+	result := tq.GetNodeByCodeQuery(tq.db, code, tenantID, tenantType).First(&node)
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return nil, ErrUnauthorized
@@ -143,16 +124,37 @@ func (tq *TreeQuery) GetNodeByCode(code NodeID, tenantID uint, tenantType string
 	}
 
 	return &node, nil
+}
+
+func (tq *TreeQuery) GetNodeByIDQuery(tx *gorm.DB, id any, tenantID, tenantType string) *gorm.DB {
+	return tq.db.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType))
+}
+
+// GetNodeByID retrieves a node by its ID with tenant security
+func (tq *TreeQuery) GetNodeByID(id any, tenantID, tenantType string) (*TreeNode, error) {
+	var node TreeNode
+	result := tq.GetNodeByIDQuery(tq.db, id, tenantID, tenantType).First(&node, id)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, ErrUnauthorized
+		}
+		return nil, result.Error
+	}
+
+	return &node, nil
+}
+
+func (tq *TreeQuery) GetNodeByPathQuery(tx *gorm.DB, path Path, tenantID, tenantType string) *gorm.DB {
+	return tq.db.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Where(TreeNode{Path: path})
 }
 
 // GetNodeByPath retrieves a node by its path with tenant security
-func (tq *TreeQuery) GetNodeByPath(path Path, tenantID uint, tenantType string) (*TreeNode, error) {
+func (tq *TreeQuery) GetNodeByPath(path Path, tenantID, tenantType string) (*TreeNode, error) {
 	var node TreeNode
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(fmt.Sprintf(CondPathCol, tq.config.PathColumn), string(path)).
-		First(&node)
-
+	result := tq.GetNodeByPathQuery(tq.db, path, tenantID, tenantType).First(&node)
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return nil, ErrUnauthorized
@@ -163,32 +165,31 @@ func (tq *TreeQuery) GetNodeByPath(path Path, tenantID uint, tenantType string) 
 	return &node, nil
 }
 
-// GetParent retrieves the parent of a node
-func (tq *TreeQuery) GetParent(nodeID uint, tenantID uint, tenantType string) (*TreeNode, error) {
-	var node TreeNode
+func (tq *TreeQuery) GetParentByNodeQuery(tx *gorm.DB, node *TreeNode, tenantID, tenantType string) *gorm.DB {
+	if node == nil {
+		tx.AddError(errors.New("node is nil"))
+		return tx
+	}
 
-	// First get the node with its parent ID
-	result := tq.db.Table(tq.config.TableName).
+	// If it's a root node (parent_id is null)
+	if node.ParentID == nil {
+		tx.AddError(errors.New("node is a root node"))
+		return tx
+	}
+	if err := node.ParentID.Validate(); err != nil {
+		tx.AddError(errors.New("invalid parent code"))
+		return tx
+	}
+
+	return tq.db.Table(tq.config.TableName).
 		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(CondID, nodeID).
-		First(&node)
+		Where(TreeNode{Code: *node.ParentID})
+}
 
-	if result.Error != nil {
-		return nil, result.Error
-	}
-
-	// If it's a root node (parent_id is 0 or null)
-	if node.ParentID == 0 {
-		return nil, errors.New("root node has no parent")
-	}
-
+func (tq *TreeQuery) GetParentByNode(node *TreeNode, tenantID, tenantType string) (*TreeNode, error) {
 	// Get the parent node
 	var parent TreeNode
-	result = tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(CondID, node.ParentID).
-		First(&parent)
-
+	result := tq.GetParentByNodeQuery(tq.db, node, tenantID, tenantType).First(&parent)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -196,54 +197,89 @@ func (tq *TreeQuery) GetParent(nodeID uint, tenantID uint, tenantType string) (*
 	return &parent, nil
 }
 
+func (tq *TreeQuery) GetParentByCodeQuery(tx *gorm.DB, code Code, tenantID, tenantType string) *gorm.DB {
+	// First get the node with its parent ID using the code
+	node, err := tq.GetNodeByCode(code, tenantID, tenantType)
+	if err != nil {
+		tx.AddError(err)
+		return tx
+	}
+
+	return tq.GetParentByNodeQuery(tx, node, tenantID, tenantType)
+}
+
 // GetParentByCode retrieves the parent of a node by its code
-func (tq *TreeQuery) GetParentByCode(code NodeID, tenantID uint, tenantType string) (*TreeNode, error) {
+func (tq *TreeQuery) GetParentByCode(code Code, tenantID, tenantType string) (*TreeNode, error) {
 	// First get the node with its parent ID using the code
 	node, err := tq.GetNodeByCode(code, tenantID, tenantType)
 	if err != nil {
 		return nil, err
 	}
 
-	// If it's a root node (parent_id is 0 or null)
-	if node.ParentID == 0 {
-		return nil, errors.New("root node has no parent")
+	return tq.GetParentByNode(node, tenantID, tenantType)
+}
+
+func (tq *TreeQuery) GetParentByIDQuery(tx *gorm.DB, id any, tenantID, tenantType string) *gorm.DB {
+	// First get the node with its parent ID using the id
+	node, err := tq.GetNodeByID(id, tenantID, tenantType)
+	if err != nil {
+		tx.AddError(err)
+		return tx
 	}
 
-	// Get the parent node
-	var parent TreeNode
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(CondID, node.ParentID).
-		First(&parent)
+	return tq.GetParentByNodeQuery(tx, node, tenantID, tenantType)
+}
 
-	if result.Error != nil {
-		return nil, result.Error
+// GetParentByID retrieves the parent of a node
+func (tq *TreeQuery) GetParentByID(id any, tenantID, tenantType string) (*TreeNode, error) {
+	// First get the node ID from the id
+	node, err := tq.GetNodeByID(id, tenantID, tenantType)
+	if err != nil {
+		return nil, err
 	}
 
-	return &parent, nil
+	return tq.GetParentByNode(node, tenantID, tenantType)
+}
+
+func (tq *TreeQuery) GetParentByPathQuery(tx *gorm.DB, nodePath Path, tenantID, tenantType string) *gorm.DB {
+	// First get the node with its parent ID using the path
+	node, err := tq.GetNodeByPath(nodePath, tenantID, tenantType)
+	if err != nil {
+		tx.AddError(err)
+		return tx
+	}
+
+	return tq.GetParentByNodeQuery(tx, node, tenantID, tenantType)
 }
 
 // GetParentByPath retrieves the parent of a node by its path
-func (tq *TreeQuery) GetParentByPath(nodePath Path, tenantID uint, tenantType string) (*TreeNode, error) {
+func (tq *TreeQuery) GetParentByPath(nodePath Path, tenantID, tenantType string) (*TreeNode, error) {
 	// First get the node ID from the path
 	node, err := tq.GetNodeByPath(nodePath, tenantID, tenantType)
 	if err != nil {
 		return nil, err
 	}
 
-	return tq.GetParent(node.ID, tenantID, tenantType)
+	return tq.GetParentByNode(node, tenantID, tenantType)
 }
 
-// GetChildren retrieves all direct children of a node
-func (tq *TreeQuery) GetChildren(nodeID uint, tenantID uint, tenantType string) ([]*TreeNode, error) {
+func (tq *TreeQuery) GetChildrenByParentIDQuery(tx *gorm.DB, code *Code, tenantID, tenantType string) *gorm.DB {
+	if err := ValidateNil(code); err != nil {
+		tx.AddError(err)
+		return tx
+	}
+
+	return tx.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Where(TreeNode{ParentID: code})
+}
+
+// GetChildrenByParentID retrieves all direct children of a node
+func (tq *TreeQuery) GetChildrenByParentID(code *Code, tenantID, tenantType string) ([]*TreeNode, error) {
 	var children []*TreeNode
 
 	// Get all nodes where parent_id matches the given node ID
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where("parent_id = ?", nodeID).
-		Find(&children)
-
+	result := tq.GetChildrenByParentIDQuery(tq.db, code, tenantID, tenantType).Find(&children)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -251,38 +287,64 @@ func (tq *TreeQuery) GetChildren(nodeID uint, tenantID uint, tenantType string) 
 	return children, nil
 }
 
+func (tq *TreeQuery) GetChildrenByCodeQuery(tx *gorm.DB, code Code, tenantID, tenantType string) *gorm.DB {
+	// First get the node from the code
+	node, err := tq.GetNodeByCode(code, tenantID, tenantType)
+	if err != nil {
+		tx.AddError(err)
+		return tx
+	}
+
+	return tq.GetChildrenByParentIDQuery(tx, &node.Code, tenantID, tenantType)
+}
+
 // GetChildrenByCode retrieves all direct children of a node by its code
-func (tq *TreeQuery) GetChildrenByCode(code NodeID, tenantID uint, tenantType string) ([]*TreeNode, error) {
+func (tq *TreeQuery) GetChildrenByCode(code Code, tenantID, tenantType string) ([]*TreeNode, error) {
 	// First get the node ID from the code
 	node, err := tq.GetNodeByCode(code, tenantID, tenantType)
 	if err != nil {
 		return nil, err
 	}
 
-	return tq.GetChildren(node.ID, tenantID, tenantType)
+	return tq.GetChildrenByParentID(&node.Code, tenantID, tenantType)
+}
+
+// GetChildrenByPathQuery returns a query builder for retrieving all direct children of a node by its path
+func (tq *TreeQuery) GetChildrenByPathQuery(tx *gorm.DB, parentPath Path, tenantID, tenantType string) *gorm.DB {
+	// First get the node from the path
+	node, err := tq.GetNodeByPath(parentPath, tenantID, tenantType)
+	if err != nil {
+		tx.AddError(err)
+		return tx
+	}
+
+	return tq.GetChildrenByParentIDQuery(tx, &node.Code, tenantID, tenantType)
 }
 
 // GetChildrenByPath retrieves all direct children of a node by its path
 // This is an alternative method that uses the path when node ID is not available
-func (tq *TreeQuery) GetChildrenByPath(parentPath Path, tenantID uint, tenantType string) ([]*TreeNode, error) {
+func (tq *TreeQuery) GetChildrenByPath(parentPath Path, tenantID, tenantType string) ([]*TreeNode, error) {
 	// First get the node ID from the path
 	node, err := tq.GetNodeByPath(parentPath, tenantID, tenantType)
 	if err != nil {
 		return nil, err
 	}
 
-	return tq.GetChildren(node.ID, tenantID, tenantType)
+	return tq.GetChildrenByParentID(&node.Code, tenantID, tenantType)
+}
+
+// GetDescendantsQuery returns a query builder for retrieving all descendants of a node
+func (tq *TreeQuery) GetDescendantsQuery(tx *gorm.DB, parentPath Path, tenantID, tenantType string) *gorm.DB {
+	return tx.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Where("path LIKE ? AND path != ?", parentPath.GetPathPrefix(), string(parentPath))
 }
 
 // GetDescendants retrieves all descendants of a node
-func (tq *TreeQuery) GetDescendants(parentPath Path, tenantID uint, tenantType string) ([]*TreeNode, error) {
+func (tq *TreeQuery) GetDescendants(parentPath Path, tenantID, tenantType string) ([]*TreeNode, error) {
 	var descendants []*TreeNode
 
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(fmt.Sprintf("%s LIKE ? AND %s != ?",
-			tq.config.PathColumn, tq.config.PathColumn),
-			parentPath.GetPathPrefix(), string(parentPath)).
+	result := tq.GetDescendantsQuery(tq.db, parentPath, tenantID, tenantType).
 		Find(&descendants)
 
 	if result.Error != nil {
@@ -292,57 +354,47 @@ func (tq *TreeQuery) GetDescendants(parentPath Path, tenantID uint, tenantType s
 	return descendants, nil
 }
 
+// GetAncestorsQuery returns a query builder for retrieving all ancestors of a node
+func (tq *TreeQuery) GetAncestorsQuery(tx *gorm.DB, nodePath Path, tenantID, tenantType string) *gorm.DB {
+	if nodePath.IsRoot() {
+		return tx.Where("1 = 0") // Return empty query for root node
+	}
+
+	ancestorPaths := make([]Path, 0)
+	for i := 1; i <= len(nodePath.GetNodeIDs()); i++ {
+		if ancestorPath, err := nodePath.GetAncestorAtDepth(i); err == nil {
+			ancestorPaths = append(ancestorPaths, ancestorPath)
+		}
+	}
+
+	return tx.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Where("path IN (?)", ancestorPaths).
+		Order("LENGTH(path), path")
+}
+
 // GetAncestors retrieves all ancestors of a node
-func (tq *TreeQuery) GetAncestors(nodePath Path, tenantID uint, tenantType string) ([]*TreeNode, error) {
+func (tq *TreeQuery) GetAncestors(nodePath Path, tenantID, tenantType string) ([]*TreeNode, error) {
 	if nodePath.IsRoot() {
 		return []*TreeNode{}, nil
 	}
 
 	var ancestors []*TreeNode
 
-	parentPath, err := nodePath.Parent()
-	if err != nil {
-		return nil, err
-	}
-
-	nodeID, err := nodePath.GetLastNodeID()
-	if err != nil {
-		return nil, err
-	}
-
-	// Get all possible ancestor paths in a single query
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where("code IN (?) and code != ?", parentPath.GetNodeIDs(), nodeID).
+	result := tq.GetAncestorsQuery(tq.db, nodePath, tenantID, tenantType).
 		Find(&ancestors)
 
 	if result.Error != nil {
 		return nil, result.Error
 	}
 
-	// Sort ancestors by depth to maintain order
-	sortedAncestors := make([]*TreeNode, 0, len(ancestors))
-	ancestorMap := make(map[Path]*TreeNode)
-	for _, a := range ancestors {
-		ancestorMap[a.Path] = a
-	}
-
-	// Build the ordered ancestor list
-	for i := 1; i <= len(nodePath.GetNodeIDs()); i++ {
-		ancestorPath, err := nodePath.GetAncestorAtDepth(i)
-		if err != nil {
-			continue
-		}
-		if ancestor, ok := ancestorMap[ancestorPath]; ok {
-			sortedAncestors = append(sortedAncestors, ancestor)
-		}
-	}
-
-	return sortedAncestors, nil
+	// Since GetAncestorsQuery already orders by LENGTH(path) and path,
+	// we can return the ancestors directly without additional sorting
+	return ancestors, nil
 }
 
-// GetNestedAncestors retrieves all ancestors of a node in a nested structure
-func (tq *TreeQuery) GetNestedAncestors(nodePath Path, tenantID uint, tenantType string) (*TreeNode, error) {
+// GetAncestorsNested retrieves all ancestors of a node in a nested structure
+func (tq *TreeQuery) GetAncestorsNested(nodePath Path, tenantID, tenantType string) (*TreeNode, error) {
 	ancestors, err := tq.GetAncestors(nodePath, tenantID, tenantType)
 	if err != nil {
 		return nil, err
@@ -366,38 +418,18 @@ func (tq *TreeQuery) GetNestedAncestors(nodePath Path, tenantID uint, tenantType
 	return root, nil
 }
 
-// CreateNode creates a new node in the tree
-func (tq *TreeQuery) CreateNode(
+// CreateNodeQuery creates a new node query in the tree
+func (tq *TreeQuery) CreateNodeQuery(
+	tx *gorm.DB,
 	name string,
 	parentPath Path,
-	tenantID uint,
+	tenantID,
 	tenantType string,
-	ownerID uint,
+	ownerID,
 	ownerType string,
-	metadata map[string]interface{},
-) (*TreeNode, error) {
-	// Start transaction
-	tx := tq.db.Begin()
-	if tx.Error != nil {
-		return nil, tx.Error
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
-
-	var parentID uint = 0 // Default to 0 for root
-
-	// Verify parent exists if not root
-	if !parentPath.IsRoot() {
-		parent, err := tq.GetNodeByPath(parentPath, tenantID, tenantType)
-		if err != nil {
-			tx.Rollback()
-			return nil, fmt.Errorf("parent node not found: %w", err)
-		}
-		parentID = parent.ID
-	}
+) (*TreeNode, *gorm.DB, error) {
+	var parent *TreeNode
+	var parentID *Code // Default to nil for root
 
 	// Generate a unique NodeID
 	newNodeID := NewNodeID()
@@ -405,50 +437,85 @@ func (tq *TreeQuery) CreateNode(
 	// Create path for new node
 	nodePath, err := parentPath.AppendNode(newNodeID)
 	if err != nil {
-		tx.Rollback()
-		return nil, err
+		return nil, nil, err
+	}
+
+	// If not root, get parent
+	if !parentPath.IsRoot() {
+		parent, err = tq.GetNodeByPath(parentPath, tenantID, tenantType)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parent node not found: %w", err)
+		}
+		parentID = &parent.Code
 	}
 
 	// Create the node with all required fields
 	node := &TreeNode{
-		Code:       newNodeID,
-		Name:       name,
-		Path:       nodePath,
-		TenantID:   tenantID,
-		TenantType: tenantType,
-		ParentID:   parentID,
-		OwnerID:    ownerID,
-		OwnerType:  ownerType,
-		Metadata:   metadata,
+		Code:     newNodeID,
+		Name:     name,
+		Path:     nodePath,
+		Parent:   parent,
+		ParentID: parentID,
+		Tenant: TenantFields{
+			ID:   tenantID,
+			Type: tenantType,
+		},
+		Owner: OwnerFields{
+			ID:   ownerID,
+			Type: ownerType,
+		},
 	}
 
-	// Create the node in the database
-	result := tx.Table(tq.config.TableName).Create(node)
-	if result.Error != nil {
-		tx.Rollback()
-		return nil, result.Error
+	db := tx
+	if db == nil {
+		db = tq.db
 	}
 
-	// Commit transaction
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
+	return node, db.Table(tq.config.TableName), nil
+}
+
+// CreateNode creates a new node in the tree
+func (tq *TreeQuery) CreateNode(
+	name string,
+	parentPath Path,
+	tenantID,
+	tenantType string,
+	ownerID,
+	ownerType string,
+) (node *TreeNode, err error) {
+	err = tq.db.Transaction(func(tx *gorm.DB) error {
+		var txErr error
+		node, tx, txErr = tq.CreateNodeQuery(tx, name, parentPath, tenantID, tenantType, ownerID, ownerType)
+		if txErr != nil {
+			return txErr
+		}
+
+		if err := tx.Create(node).Error; err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
 		return nil, err
 	}
 
 	return node, nil
 }
 
-// UpdateNode updates a node's properties
-func (tq *TreeQuery) UpdateNode(
-	id uint,
-	tenantID uint,
+// UpdateNodeQuery prepares the query for updating a node
+func (tq *TreeQuery) UpdateNodeQuery(
+	tx *gorm.DB,
+	code Code,
+	tenantID,
 	tenantType string,
 	updates map[string]interface{},
-) error {
+) (*gorm.DB, error) {
 	// First check if node exists and belongs to tenant
-	_, err := tq.GetNodeByID(id, tenantID, tenantType)
+	_, err := tq.GetNodeByCode(code, tenantID, tenantType)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Remove protected fields from updates
@@ -462,12 +529,32 @@ func (tq *TreeQuery) UpdateNode(
 	delete(updates, "tenant_id")
 	delete(updates, "tenant_type")
 
-	// Apply updates
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(CondID, id).
-		Updates(updates)
+	db := tx
+	if db == nil {
+		db = tq.db
+	}
 
+	// Prepare update query
+	query := db.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Where(TreeNode{Code: code})
+
+	return query, nil
+}
+
+// UpdateNode updates a node's properties
+func (tq *TreeQuery) UpdateNode(
+	code Code,
+	tenantID,
+	tenantType string,
+	updates map[string]interface{},
+) error {
+	query, err := tq.UpdateNodeQuery(tq.db, code, tenantID, tenantType, updates)
+	if err != nil {
+		return err
+	}
+
+	result := query.Updates(updates)
 	return result.Error
 }
 
@@ -475,7 +562,7 @@ func (tq *TreeQuery) UpdateNode(
 func (tq *TreeQuery) MoveNode(
 	nodePath Path,
 	newParentPath Path,
-	tenantID uint,
+	tenantID,
 	tenantType string,
 ) error {
 	// Start a transaction
@@ -497,14 +584,14 @@ func (tq *TreeQuery) MoveNode(
 	}
 
 	// Get new parent ID
-	var newParentID uint = 0 // Default to 0 for root
+	var newParentID *Code // Default to nil for root
 	if !newParentPath.IsRoot() {
 		newParent, err := tq.GetNodeByPath(newParentPath, tenantID, tenantType)
 		if err != nil {
 			tx.Rollback()
 			return fmt.Errorf("new parent node not found: %w", err)
 		}
-		newParentID = newParent.ID
+		newParentID = newParent.ParentID
 
 		// Check that new parent is not a descendant of the node being moved
 		if nodePath.Contains(newParentPath) {
@@ -513,52 +600,34 @@ func (tq *TreeQuery) MoveNode(
 		}
 	}
 
-	// Get the node ID of the node being moved
-	nodeID, err := nodePath.GetLastNodeID()
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-
 	// Create new path for the node
-	newPath, err := newParentPath.AppendNode(nodeID)
+	newPath, err := newParentPath.AppendNode(node.Code)
 	if err != nil {
 		tx.Rollback()
 		return err
 	}
 
-	// Get all descendants to update their paths
-	descendants, err := tq.GetDescendants(nodePath, tenantID, tenantType)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	// Update the node's path and parent_id
+	// Update the node and all its descendants in a single query
 	if err := tx.Table(tq.config.TableName).
 		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where("id = ?", node.ID).
+		Where("path = ? OR path LIKE ?", string(nodePath), nodePath.GetPathPrefix()).
 		Updates(map[string]interface{}{
-			tq.config.PathColumn: string(newPath),
-			"parent_id":          newParentID,
+			"path": gorm.Expr("CONCAT(?, SUBSTRING(path, ?))",
+				string(newPath),
+				len(string(nodePath))+1,
+			),
 		}).Error; err != nil {
 		tx.Rollback()
 		return err
 	}
 
-	// Update all descendants' paths
-	for _, descendant := range descendants {
-		descendantPath := Path(descendant.Path)
-		relPath := descendantPath[len(string(nodePath)):]
-		newDescPath := newPath + relPath
-
-		if err := tx.Table(tq.config.TableName).
-			Scopes(tq.tenantScope(tenantID, tenantType)).
-			Where("id = ?", descendant.ID).
-			Update(tq.config.PathColumn, string(newDescPath)).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
+	// Update the moved node's parent_id separately
+	if err := tx.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Where(TreeNode{Code: node.Code}).
+		Updates(&TreeNode{ParentID: newParentID}).Error; err != nil {
+		tx.Rollback()
+		return err
 	}
 
 	return tx.Commit().Error
@@ -567,7 +636,7 @@ func (tq *TreeQuery) MoveNode(
 // DeleteNode deletes a node and optionally its descendants
 func (tq *TreeQuery) DeleteNode(
 	nodePath Path,
-	tenantID uint,
+	tenantID,
 	tenantType string,
 	deleteDescendants bool,
 ) error {
@@ -593,9 +662,7 @@ func (tq *TreeQuery) DeleteNode(
 	var count int64
 	if err := tx.Table(tq.config.TableName).
 		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(fmt.Sprintf("%s LIKE ? AND %s != ?",
-			tq.config.PathColumn, tq.config.PathColumn),
-			nodePath.GetPathPrefix(), string(nodePath)).
+		Where("path LIKE ? AND path != ?", nodePath.GetPathPrefix(), string(nodePath)).
 		Count(&count).Error; err != nil {
 		tx.Rollback()
 		return err
@@ -611,12 +678,9 @@ func (tq *TreeQuery) DeleteNode(
 			return errors.New("cannot delete node with descendants, set deleteDescendants to true")
 		}
 
-		query = query.Where(fmt.Sprintf("%s = ?", tq.config.PathColumn),
-			string(nodePath))
+		query = query.Where("path = ?", string(nodePath))
 	} else {
-		query = query.Where(fmt.Sprintf("%s = ? OR %s LIKE ?",
-			tq.config.PathColumn, tq.config.PathColumn),
-			string(nodePath), nodePath.GetPathPrefix())
+		query = query.Where("path = ? OR path LIKE ?", string(nodePath), nodePath.GetPathPrefix())
 	}
 
 	if err := query.Delete(&TreeNode{}).Error; err != nil {
@@ -630,7 +694,7 @@ func (tq *TreeQuery) DeleteNode(
 // SearchNodes searches for nodes by name or metadata with tenant security
 func (tq *TreeQuery) SearchNodes(
 	query string,
-	tenantID uint,
+	tenantID,
 	tenantType string,
 	limit int,
 	offset int,
@@ -662,11 +726,23 @@ func (tq *TreeQuery) SearchNodes(
 	return nodes, count, nil
 }
 
+// GetNodesByOwnerQuery returns a query builder for nodes associated with a specific owner
+func (tq *TreeQuery) GetNodesByOwnerQuery(
+	ownerID,
+	ownerType,
+	tenantID,
+	tenantType string,
+) *gorm.DB {
+	return tq.db.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Scopes(tq.ownerScope(ownerID, ownerType))
+}
+
 // GetNodesByOwner retrieves nodes associated with a specific owner
 func (tq *TreeQuery) GetNodesByOwner(
-	ownerID uint,
-	ownerType string,
-	tenantID uint,
+	ownerID,
+	ownerType,
+	tenantID,
 	tenantType string,
 	limit int,
 	offset int,
@@ -674,13 +750,9 @@ func (tq *TreeQuery) GetNodesByOwner(
 	var nodes []*TreeNode
 	var count int64
 
-	// Count total matches
-	query := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(fmt.Sprintf("%s = ? AND %s = ?",
-			tq.config.OwnerIDColumn, tq.config.OwnerTypeColumn),
-			ownerID, ownerType)
+	query := tq.GetNodesByOwnerQuery(ownerID, ownerType, tenantID, tenantType)
 
+	// Count total matches
 	if err := query.Count(&count).Error; err != nil {
 		return nil, 0, err
 	}
@@ -698,10 +770,28 @@ func (tq *TreeQuery) GetNodesByOwner(
 	return nodes, count, nil
 }
 
+// GetNodesByDepthQuery returns a query builder for nodes at a specific depth in the tree
+func (tq *TreeQuery) GetNodesByDepthQuery(
+	tx *gorm.DB,
+	depth int,
+	tenantID,
+	tenantType string,
+) *gorm.DB {
+	// For depth 0, return just the root node query
+	if depth == 0 {
+		return tq.GetRootNodeQuery(tx, tenantID, tenantType)
+	}
+
+	// For other depths, we need to count path separators
+	return tx.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Where("(LENGTH(path) - LENGTH(REPLACE(path, ?, ''))) / ? = ?", PathSeparator, len(PathSeparator), depth)
+}
+
 // GetNodesByDepth retrieves nodes at a specific depth in the tree
 func (tq *TreeQuery) GetNodesByDepth(
 	depth int,
-	tenantID uint,
+	tenantID,
 	tenantType string,
 ) ([]*TreeNode, error) {
 	var nodes []*TreeNode
@@ -716,12 +806,7 @@ func (tq *TreeQuery) GetNodesByDepth(
 		return []*TreeNode{rootNode}, nil
 	}
 
-	// For other depths, we need to count path separators
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(fmt.Sprintf("(LENGTH(%s) - LENGTH(REPLACE(%s, ?, ''))) / ? = ?",
-			tq.config.PathColumn, tq.config.PathColumn),
-			PathSeparator, len(PathSeparator), depth).
+	result := tq.GetNodesByDepthQuery(tq.db, depth, tenantID, tenantType).
 		Find(&nodes)
 
 	if result.Error != nil {
@@ -731,24 +816,33 @@ func (tq *TreeQuery) GetNodesByDepth(
 	return nodes, nil
 }
 
+// GetRootNodeQuery returns a query builder for the root node
+func (tq *TreeQuery) GetRootNodeQuery(
+	tx *gorm.DB,
+	tenantID,
+	tenantType string,
+) *gorm.DB {
+	return tx.Table(tq.config.TableName).
+		Scopes(tq.tenantScope(tenantID, tenantType)).
+		Where(TreeNode{Path: RootPath})
+}
+
 // GetRootNode retrieves the root node for a tenant
-func (tq *TreeQuery) GetRootNode(tenantID uint, tenantType string) (*TreeNode, error) {
+func (tq *TreeQuery) GetRootNode(tenantID, tenantType string) (*TreeNode, error) {
 	var rootNode TreeNode
 
 	result := tq.db.Table(tq.config.TableName).
 		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(fmt.Sprintf(CondPathCol, tq.config.PathColumn), string(RootPath)).
+		Where(TreeNode{Path: RootPath}).
 		First(&rootNode)
 
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			// Create root node if it doesn't exist
 			rootNode = TreeNode{
-				Path:       RootPath,
-				Name:       "Root",
-				TenantID:   tenantID,
-				TenantType: tenantType,
-				Metadata:   map[string]interface{}{"isRoot": true},
+				Path:   RootPath,
+				Name:   "root",
+				Tenant: TenantFields{tenantID, tenantType},
 			}
 
 			if err := tq.db.Table(tq.config.TableName).Create(&rootNode).Error; err != nil {
@@ -768,11 +862,10 @@ func (tq *TreeQuery) BatchCreateNodes(
 	nodes []struct {
 		Name       string
 		ParentPath Path
-		OwnerID    uint
+		OwnerID    string
 		OwnerType  string
-		Metadata   map[string]interface{}
 	},
-	tenantID uint,
+	tenantID,
 	tenantType string,
 ) ([]*TreeNode, error) {
 	tx := tq.db.Begin()
@@ -789,7 +882,7 @@ func (tq *TreeQuery) BatchCreateNodes(
 	batchNodes := make([]*TreeNode, 0, len(nodes))
 
 	// Create a map to store parent paths and their IDs
-	parentPathMap := make(map[Path]uint)
+	parentPathMap := make(map[Path]*Code)
 	uniqueParentPaths := make([]Path, 0)
 
 	// Collect unique parent paths
@@ -807,7 +900,7 @@ func (tq *TreeQuery) BatchCreateNodes(
 		var parentNodes []*TreeNode
 		result := tx.Table(tq.config.TableName).
 			Scopes(tq.tenantScope(tenantID, tenantType)).
-			Where(fmt.Sprintf("%s IN ?", tq.config.PathColumn), uniqueParentPaths).
+			Where("path IN (?)", uniqueParentPaths).
 			Find(&parentNodes)
 
 		if result.Error != nil {
@@ -817,13 +910,13 @@ func (tq *TreeQuery) BatchCreateNodes(
 
 		// Build parent path to ID map
 		for _, parent := range parentNodes {
-			parentPathMap[parent.Path] = parent.ID
+			parentPathMap[parent.Path] = &parent.Code
 		}
 	}
 
 	// Create nodes using the parent path map
 	for _, nodeInfo := range nodes {
-		parentID := uint(0)
+		var parentID *Code
 		if !nodeInfo.ParentPath.IsRoot() {
 			var exists bool
 			parentID, exists = parentPathMap[nodeInfo.ParentPath]
@@ -841,15 +934,12 @@ func (tq *TreeQuery) BatchCreateNodes(
 		}
 
 		node := &TreeNode{
-			Code:       newNodeID,
-			Path:       nodePath,
-			Name:       nodeInfo.Name,
-			TenantID:   tenantID,
-			TenantType: tenantType,
-			ParentID:   parentID,
-			OwnerID:    nodeInfo.OwnerID,
-			OwnerType:  nodeInfo.OwnerType,
-			Metadata:   nodeInfo.Metadata,
+			Code:     newNodeID,
+			Path:     nodePath,
+			Name:     nodeInfo.Name,
+			ParentID: parentID,
+			Tenant:   TenantFields{tenantID, tenantType},
+			Owner:    OwnerFields{nodeInfo.OwnerID, nodeInfo.OwnerType},
 		}
 
 		batchNodes = append(batchNodes, node)
@@ -868,85 +958,13 @@ func (tq *TreeQuery) BatchCreateNodes(
 	return createdNodes, nil
 }
 
-// CreateSchema creates the database schema for the tree table
-func (tq *TreeQuery) CreateSchema() error {
-	// Define table creation SQL
-	tableSQL := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
-			id SERIAL PRIMARY KEY,
-			code VARCHAR(26) NOT NULL UNIQUE,
-			parent_id INTEGER DEFAULT 0,
-			%s TEXT NOT NULL,
-			name TEXT NOT NULL,
-			%s INTEGER NOT NULL,
-			%s TEXT NOT NULL,
-			%s INTEGER NOT NULL,
-			%s TEXT NOT NULL,
-			metadata JSONB,
-			created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-			deleted_at TIMESTAMP WITH TIME ZONE
-		)`,
-		tq.config.TableName,
-		tq.config.PathColumn,
-		tq.config.TenantIDColumn,
-		tq.config.TenantTypeColumn,
-		tq.config.OwnerIDColumn,
-		tq.config.OwnerTypeColumn)
+// MigrateDefault creates the database schema for the tree table
+func (tq *TreeQuery) MigrateDefault() error {
+	return tq.db.AutoMigrate(&TreeNode{})
+}
 
-	// Define indexes as separate statements for better maintainability
-	indexStatements := []string{
-		// Node ID index
-		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_code ON %s (code)",
-			tq.config.TableName, tq.config.TableName),
-
-		// Path index
-		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_%s ON %s (%s)",
-			tq.config.TableName, tq.config.PathColumn, tq.config.TableName, tq.config.PathColumn),
-
-		// Tenant composite index
-		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_tenant ON %s (%s, %s)",
-			tq.config.TableName, tq.config.TableName, tq.config.TenantIDColumn, tq.config.TenantTypeColumn),
-
-		// Owner composite index
-		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_owner ON %s (%s, %s)",
-			tq.config.TableName, tq.config.TableName, tq.config.OwnerIDColumn, tq.config.OwnerTypeColumn),
-
-		// Parent ID index
-		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_parent ON %s (parent_id)",
-			tq.config.TableName, tq.config.TableName),
-
-		// Path prefix index for hierarchical queries
-		fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_path_prefix ON %s (%s text_pattern_ops)",
-			tq.config.TableName, tq.config.TableName, tq.config.PathColumn),
-	}
-
-	// Execute table creation in a transaction
-	tx := tq.db.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
-
-	// Create table
-	if err := tx.Exec(tableSQL).Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to create table: %w", err)
-	}
-
-	// Create indexes
-	for i, indexSQL := range indexStatements {
-		if err := tx.Exec(indexSQL).Error; err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to create index #%d: %w", i+1, err)
-		}
-	}
-
-	return tx.Commit().Error
+func (tq *TreeQuery) Migrate(m any) error {
+	return tq.db.AutoMigrate(m)
 }
 
 // WithTransaction allows executing operations within an existing transaction
@@ -957,50 +975,88 @@ func (tq *TreeQuery) WithTransaction(tx *gorm.DB) *TreeQuery {
 	}
 }
 
-// GetNodeWithChildren retrieves a node with its direct children preloaded
-func (tq *TreeQuery) GetNodeWithChildren(
-	nodeID uint,
-	tenantID uint,
+// GetNodeWithChildrenByPathQuery returns a query builder for retrieving a node with its direct children by path
+func (tq *TreeQuery) GetNodeWithChildrenByPathQuery(
+	tx *gorm.DB,
+	tenantID,
+	tenantType string,
+	path Path,
+	limit,
+	offset int,
+) (*gorm.DB, *TreeNode, int64, error) {
+	node, err := tq.GetNodeByPath(path, tenantID, tenantType)
+	tx, count, err := tq.loadNodeChildrenQuery(tx, tenantID, tenantType, node.Code, limit, offset, err)
+	if err != nil {
+		return tx, nil, 0, err
+	}
+
+	return tx, node, count, nil
+}
+
+// GetNodeWithChildrenByPath retrieves a node with its direct children preloaded using the node path
+// with pagination support for the children
+func (tq *TreeQuery) GetNodeWithChildrenByPath(
+	path Path,
+	tenantID,
 	tenantType string,
 	limit int,
 	offset int,
 ) (*TreeNode, int64, error) {
-	var node TreeNode
+	query, node, count, err := tq.GetNodeWithChildrenByPathQuery(tq.db, tenantID, tenantType, path, limit, offset)
+	err = tq.setNodeChildren(query, node, err)
+	if err != nil {
+		return nil, 0, err
+	}
 
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where(CondID, nodeID).
-		First(&node)
+	return node, count, nil
+}
 
-	return tq.loadNodeChildren(&node, tenantID, tenantType, limit, offset, result.Error)
+// GetNodeWithChildrenByCodeQuery returns a query builder for retrieving a node with its direct children by code
+func (tq *TreeQuery) GetNodeWithChildrenByCodeQuery(
+	tx *gorm.DB,
+	tenantID,
+	tenantType string,
+	code Code,
+	limit,
+	offset int,
+) (*gorm.DB, *TreeNode, int64, error) {
+	node, err := tq.GetNodeByCode(code, tenantID, tenantType)
+	tx, count, err := tq.loadNodeChildrenQuery(tx, tenantID, tenantType, code, limit, offset, err)
+	if err != nil {
+		return tx, nil, 0, err
+	}
+
+	return tx, node, count, nil
 }
 
 // GetNodeWithChildrenByCode retrieves a node with its direct children preloaded using the node code
 // with pagination support for the children
 func (tq *TreeQuery) GetNodeWithChildrenByCode(
-	code NodeID,
-	tenantID uint,
+	code Code,
+	tenantID,
 	tenantType string,
 	limit int,
 	offset int,
-) (*TreeNode, int64, error) {
-	var node TreeNode
-	result := tq.db.Table(tq.config.TableName).
-		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where("code = ?", code).
-		First(&node)
+) (node *TreeNode, count int64, err error) {
+	query, node, count, err := tq.GetNodeWithChildrenByCodeQuery(tq.db, tenantID, tenantType, code, limit, offset)
+	err = tq.setNodeChildren(query, node, err)
+	if err != nil {
+		return nil, 0, err
+	}
 
-	return tq.loadNodeChildren(&node, tenantID, tenantType, limit, offset, result.Error)
+	return node, count, nil
 }
 
-func (tq *TreeQuery) loadNodeChildren(
-	node *TreeNode,
-	tenantID uint,
+// loadNodeChildrenQuery returns a query builder for loading children of a node
+func (tq *TreeQuery) loadNodeChildrenQuery(
+	tx *gorm.DB,
+	tenantID,
 	tenantType string,
+	parentCode Code,
 	limit int,
 	offset int,
 	loadErr error,
-) (*TreeNode, int64, error) {
+) (*gorm.DB, int64, error) {
 	if loadErr != nil {
 		if errors.Is(loadErr, gorm.ErrRecordNotFound) {
 			return nil, 0, ErrUnauthorized
@@ -1009,23 +1065,32 @@ func (tq *TreeQuery) loadNodeChildren(
 		return nil, 0, loadErr
 	}
 
-	query := tq.db.Table(tq.config.TableName).
+	query := tx.Table(tq.config.TableName).
 		Scopes(tq.tenantScope(tenantID, tenantType)).
-		Where("parent_id = ?", node.ID)
+		Where(TreeNode{ParentID: &parentCode})
 
-	var totalChildren int64
-	if err := query.Count(&totalChildren).Error; err != nil {
+	var count int64
+	if err := query.Count(&count).Error; err != nil {
 		return nil, 0, err
+	}
+
+	return query.Limit(limit).Offset(offset), count, nil
+}
+
+func (tq *TreeQuery) setNodeChildren(
+	query *gorm.DB,
+	node *TreeNode,
+	err error,
+) error {
+	if err != nil {
+		return err
 	}
 
 	var children []*TreeNode
-	if err := query.
-		Limit(limit).
-		Offset(offset).
-		Find(&children).Error; err != nil {
-		return nil, 0, err
+	if err := query.Find(&children).Error; err != nil {
+		return err
 	}
 
 	node.Children = children
-	return node, totalChildren, nil
+	return nil
 }
